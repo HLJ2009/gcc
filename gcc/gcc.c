@@ -277,6 +277,12 @@ static enum save_temps {
 static char *save_temps_prefix = 0;
 static size_t save_temps_length = 0;
 
+/* Explicit -dumpdir, -dumpbase and -dumpbase-ext flags.  */
+static bool save_temps_overrides_dumpdir = false;
+static bool append_input_name_to_save_temps_prefix = false;
+static bool issue_dumpdir = false;
+static char *dumpdir, *dumpbase, *dumpbase_ext;
+
 /* The compiler version.  */
 
 static const char *compiler_version;
@@ -402,13 +408,14 @@ static const char *find_plugindir_spec_function (int, const char **);
 static const char *print_asm_header_spec_function (int, const char **);
 static const char *compare_debug_dump_opt_spec_function (int, const char **);
 static const char *compare_debug_self_opt_spec_function (int, const char **);
-static const char *compare_debug_auxbase_opt_spec_function (int, const char **);
 static const char *pass_through_libs_spec_func (int, const char **);
-static const char *replace_extension_spec_func (int, const char **);
+static const char *dumps_spec_func (int, const char **);
 static const char *greater_than_spec_func (int, const char **);
 static const char *debug_level_greater_than_spec_func (int, const char **);
 static const char *find_fortran_preinclude_file (int, const char **);
 static char *convert_white_space (char *);
+static bool not_actual_file_p (const char *);
+
 
 /* The Specs Language
 
@@ -427,11 +434,17 @@ or with constant text in a single argument.
 
  %%	substitute one % into the program name or argument.
  %i     substitute the name of the input file being processed.
- %b     substitute the basename of the input file being processed.
-	This is the substring up to (and not including) the last period
-	and not including the directory unless -save-temps was specified
-	to put temporaries in a different location.
- %B	same as %b, but include the file suffix (text after the last period).
+ %b     substitute the basename for outputs related with the input file
+        being processed.  This is often a substring of the input file name,
+	up to (and not including) the last period but, unless %w is active,
+	it is affected by the directory selected by -save-temps=*, by
+	-dumpdir, and, in case of multiple compilations, even by -dumpbase
+	and -dumpbase-ext and, in case of linking, by the linker output
+	name.  When %w is active, it derives the main output name only from
+	the input file base name; when it is not, it names aux/dump output
+	file.
+ %B	same as %b, but include the input file suffix (text after the last
+	period).
  %gSUFFIX
 	substitute a file name that has suffix SUFFIX and is chosen
 	once per compilation, and mark the argument a la %d.  To reduce
@@ -641,10 +654,10 @@ proper position among the other output files.  */
 #define ASM_FINAL_SPEC \
   "%{gsplit-dwarf: \n\
        objcopy --extract-dwo \
-	 %{c:%{o*:%*}%{!o*:%b%O}}%{!c:%U%O} \
-	 %{c:%{o*:%:replace-extension(%{o*:%*} .dwo)}%{!o*:%b.dwo}}%{!c:%b.dwo} \n\
+	 %{c:%{o*:%*}%{!o*:%w%b%O}}%{!c:%U%O} \
+	 %{c:%{o*:%.dwo%*}%{!o*:%b.dwo}}%{!c:%b.dwo} \n\
        objcopy --strip-dwo \
-	 %{c:%{o*:%*}%{!o*:%b%O}}%{!c:%U%O} \
+	 %{c:%{o*:%*}%{!o*:%w%b%O}}%{!c:%U%O} \
     }"
 #endif
 
@@ -1145,16 +1158,14 @@ static const char *cpp_debug_options = "%{d*}";
 static const char *cc1_options =
 "%{pg:%{fomit-frame-pointer:%e-pg and -fomit-frame-pointer are incompatible}}\
  %{!iplugindir*:%{fplugin*:%:find-plugindir()}}\
- %1 %{!Q:-quiet} %{!dumpbase:-dumpbase %B} %{d*} %{m*} %{aux-info*}\
- %{fcompare-debug-second:%:compare-debug-auxbase-opt(%b)} \
- %{!fcompare-debug-second:%{c|S:%{o*:-auxbase-strip %*}%{!o*:-auxbase %b}}}%{!c:%{!S:-auxbase %b}} \
+ %1 %{!Q:-quiet} %{d*} %{m*} %{aux-info*} %:dumps()\
  %{g*} %{O*} %{W*&pedantic*} %{w} %{std*&ansi&trigraphs}\
  %{v:-version} %{pg:-p} %{p} %{f*} %{undef}\
  %{Qn:-fno-ident} %{Qy:} %{-help:--help}\
  %{-target-help:--target-help}\
  %{-version:--version}\
  %{-help=*:--help=%*}\
- %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %b.s}}}\
+ %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %w%b.s}}}\
  %{fsyntax-only:-o %j} %{-param*}\
  %{coverage:-fprofile-arcs -ftest-coverage}\
  %{fprofile-arcs|fprofile-generate*|coverage:\
@@ -1642,9 +1653,8 @@ static const struct spec_function static_spec_functions[] =
   { "print-asm-header",		print_asm_header_spec_function },
   { "compare-debug-dump-opt",	compare_debug_dump_opt_spec_function },
   { "compare-debug-self-opt",	compare_debug_self_opt_spec_function },
-  { "compare-debug-auxbase-opt", compare_debug_auxbase_opt_spec_function },
   { "pass-through-libs",	pass_through_libs_spec_func },
-  { "replace-extension",	replace_extension_spec_func },
+  { "dumps",                    dumps_spec_func },
   { "gt",			greater_than_spec_func },
   { "debug-level-gt",		debug_level_greater_than_spec_func },
   { "fortran-preinclude-file",	find_fortran_preinclude_file},
@@ -4153,6 +4163,23 @@ driver_handle_option (struct gcc_options *opts,
       else
 	fatal_error (input_location, "%qs is an unknown %<-save-temps%> option",
 		     decoded->orig_option_with_args_text);
+      save_temps_overrides_dumpdir = true;
+      break;
+
+    case OPT_dumpdir:
+      free (dumpdir);
+      dumpdir = xstrdup (arg);
+      save_temps_overrides_dumpdir = false;
+      break;
+
+    case OPT_dumpbase:
+      free (dumpbase);
+      dumpbase = xstrdup (arg);
+      break;
+
+    case OPT_dumpbase_ext:
+      free (dumpbase_ext);
+      dumpbase_ext = xstrdup (arg);
       break;
 
     case OPT_no_canonical_prefixes:
@@ -4303,6 +4330,19 @@ driver_handle_option (struct gcc_options *opts,
   return true;
 }
 
+/* Return true if F2 is F1 followed by a single suffix, i.e., by a
+   period and additional characters other than a period.  */
+
+static inline bool
+adds_single_suffix_p (const char *f2, const char *f1)
+{
+  size_t len = strlen (f1);
+
+  return (strncmp (f1, f2, len) == 0
+	  && f2[len] == '.'
+	  && strchr (f2 + len + 1, '.') == NULL);
+}
+
 /* Put the driver's standard set of option handlers in *HANDLERS.  */
 
 static void
@@ -4317,6 +4357,28 @@ set_option_handlers (struct cl_option_handlers *handlers)
   handlers->handlers[1].mask = CL_COMMON;
   handlers->handlers[2].handler = target_handle_option;
   handlers->handlers[2].mask = CL_TARGET;
+}
+
+
+/* Return the index into infiles for the single non-library input
+   file, -1 if there isn't any, or -2 if there is more than one.  */
+static inline int
+single_input_file_index ()
+{
+  int ret = -1;
+
+  for (int i = 0; i < n_infiles; i++)
+    {
+      if (infiles[i].language && infiles[i].language[0] == '*')
+	continue;
+
+      if (ret != -1)
+	return -2;
+
+      ret = i;
+    }
+
+  return ret;
 }
 
 /* Create the vector `switches' and its contents.
@@ -4631,12 +4693,184 @@ process_command (unsigned int decoded_options_count,
   if (output_file != NULL && output_file[0] == '\0')
     fatal_error (input_location, "output filename may not be empty");
 
+  /* -dumpdir and -save-temps=* both specify the location of aux/dump
+     outputs; the one that appears last prevails.  When compiling
+     multiple sources, an explicit dumpbase (minus -ext) may be
+     combined with an explicit or implicit dumpdir, whereas when
+     linking, a specified or implied link output name (minus
+     extension) may be combined with a prevailing -save-temps=* or an
+     otherwise implied dumpdir, but not override a prevailing
+     -dumpdir.  Primary outputs (e.g., linker output when linking
+     without -o, or .i, .s or .o outputs when processing multiple
+     inputs with -E, -S or -c, respectively) are NOT affected by these
+     -save-temps=/dump* options, always landing in the current
+     directory and with the same basename as the input when an output
+     name is not given, but when they're intermediate outputs, they
+     are named like other aux outputs, so the options affect their
+     location and name.
+
+     Here are some examples:
+
+     When compiling any number of sources, no -dump* nor
+     -save-temps=*, all outputs in cwd without prefix:
+
+     # gcc -c b.c -gsplit-dwarf
+     -> cc1 [-dumpdir ./] -dumpbase b.c -dumpbase-ext .c # b.o b.dwo
+
+     # gcc -c b.c d.c -gsplit-dwarf
+     -> cc1 [-dumpdir ./] -dumpbase b.c -dumpbase-ext .c # b.o b.dwo
+     && cc1 [-dumpdir ./] -dumpbase d.c -dumpbase-ext .c # d.o d.dwo
+
+     When compiling and linking, no -dump* nor -save-temps=*, .o
+     outputs are temporary, aux outputs land in the dir of the output,
+     prefixed with the basename of the linker output:
+
+     # gcc b.c d.c -o ab -gsplit-dwarf
+     -> cc1 -dumpdir ab- -dumpbase b.c -dumpbase-ext .c # ab-b.dwo
+     && cc1 -dumpdir ab- -dumpbase d.c -dumpbase-ext .c # ab-d.dwo
+     && link ... -o ab
+
+     # gcc b.c d.c [-o a.out] -gsplit-dwarf
+     -> cc1 -dumpdir a- -dumpbase b.c -dumpbase-ext .c # a-b.dwo
+     && cc1 -dumpdir a- -dumpbase d.c -dumpbase-ext .c # a-d.dwo
+     && link ... [-o a.out]
+
+     When compiling and linking, a prevailing -dumpdir fully overrides
+     the prefix of aux outputs given by the output name:
+
+     # gcc -dumpdir f b.c d.c -gsplit-dwarf [-o [dir/]whatever]
+     -> cc1 -dumpdir f -dumpbase b.c -dumpbase-ext .c # fb.dwo
+     && cc1 -dumpdir f -dumpbase d.c -dumpbase-ext .c # fd.dwo
+     && link ... [-o whatever]
+
+     When compiling multiple inputs, an explicit -dumpbase is combined
+     with -dumpdir, affecting aux outputs, but not the .o outputs:
+
+     # gcc -dumpdir f -dumpbase g- b.c d.c -gsplit-dwarf -c
+     -> cc1 -dumpdir fg- -dumpbase b.c -dumpbase-ext .c # b.o fg-b.dwo
+     && cc1 -dumpdir fg- -dumpbase d.c -dumpbase-ext .c # d.o fg-d.dwo
+
+     When compiling and linking with -save-temps, the .o outputs that
+     would have been temporary become aux outputs, so they get
+     affected by -dump* flags:
+
+     # gcc -dumpdir f -dumpbase g- -save-temps b.c d.c
+     -> cc1 -dumpdir fg- -dumpbase b.c -dumpbase-ext .c # fg-b.o
+     && cc1 -dumpdir fg- -dumpbase d.c -dumpbase-ext .c # fg-d.o
+     && link
+
+     If -save-temps=* prevails over -dumpdir, however, the explicit
+     -dumpdir is discarded, as if it wasn't there.  The basename of
+     the implicit linker output, a.out or a.exe, becomes a- as the aux
+     output prefix for all compilations:
+
+     # gcc [-dumpdir f] -save-temps=cwd b.c d.c
+     -> cc1 -dumpdir a- -dumpbase b.c -dumpbase-ext .c # a-b.o
+     && cc1 -dumpdir a- -dumpbase d.c -dumpbase-ext .c # a-d.o
+     && link
+
+     A single -dumpbase, applying to multiple inputs, overrides the
+     linker output name, implied or explicit, as the aux output prefix:
+
+     # gcc [-dumpdir f] -dumpbase g- -save-temps=cwd b.c d.c
+     -> cc1 -dumpdir g- -dumpbase b.c -dumpbase-ext .c # g-b.o
+     && cc1 -dumpdir g- -dumpbase d.c -dumpbase-ext .c # g-d.o
+     && link
+
+     # gcc [-dumpdir f] -dumpbase g- -save-temps=cwd b.c d.c -o dir/h.out
+     -> cc1 -dumpdir g- -dumpbase b.c -dumpbase-ext .c # g-b.o
+     && cc1 -dumpdir g- -dumpbase d.c -dumpbase-ext .c # g-d.o
+     && link -o dir/h.out
+
+     Now, if the linker output is NOT overridden as a prefix, but
+     -save-temps=* overrides implicit or explicit -dumpdir, the
+     effective dump dir combines the dir selected by the -save-temps=*
+     option with the basename of the specified or implied link output:
+
+     # gcc [-dumpdir f] -save-temps=cwd b.c d.c -o dir/h.out
+     -> cc1 -dumpdir h- -dumpbase b.c -dumpbase-ext .c # h-b.o
+     && cc1 -dumpdir h- -dumpbase d.c -dumpbase-ext .c # h-d.o
+     && link -o dir/h.out
+
+     # gcc [-dumpdir f] -save-temps=obj b.c d.c -o dir/h.out
+     -> cc1 -dumpdir dir/h- -dumpbase b.c -dumpbase-ext .c # dir/h-b.o
+     && cc1 -dumpdir dir/h- -dumpbase d.c -dumpbase-ext .c # dir/h-d.o
+     && link -o dir/h.out
+
+     But then again, a single -dumpbase applying to multiple inputs
+     gets used instead of the linker output basename in the combined
+     dumpdir:
+
+     # gcc [-dumpdir f] -dumpbase g- -save-temps=obj b.c d.c -o dir/h.out
+     -> cc1 -dumpdir dir/g- -dumpbase b.c -dumpbase-ext .c # dir/g-b.o
+     && cc1 -dumpdir dir/g- -dumpbase d.c -dumpbase-ext .c # dir/g-d.o
+     && link -o dir/h.out
+
+     With a single input being compiled, the output basename does NOT
+     affect the dumpdir prefix.
+
+     # gcc -save-temps=obj b.c -gsplit-dwarf -c -o dir/b.o
+     -> cc1 -dumpdir dir/ -dumpbase b.c -dumpbase-ext .c # dir/b.o dir/b.dwo
+
+     but when compiling and linking even a single file, it does:
+
+     # gcc -save-temps=obj b.c -o dir/h.out
+     -> cc1 -dumpdir dir/h- -dumpbase b.c -dumpbase-ext .c # dir/h-b.o
+
+     unless an explicit -dumpdir prevails:
+
+     # gcc -save-temps[=obj] -dumpdir g- b.c -o dir/h.out
+     -> cc1 -dumpdir g- -dumpbase b.c -dumpbase-ext .c # g-b.o
+
+  */
+
+  bool explicit_dumpdir = dumpdir;
+  if (!save_temps_overrides_dumpdir)
+    {
+      append_input_name_to_save_temps_prefix = true;
+
+      if (explicit_dumpdir)
+	{
+	  free (save_temps_prefix);
+	  save_temps_prefix = xstrdup (dumpdir);
+	  save_temps_length = strlen (save_temps_prefix);
+	  issue_dumpdir = false;
+	}
+      else if (save_temps_prefix)
+	{
+	  save_temps_length = strlen (save_temps_prefix);
+	  issue_dumpdir = false;
+
+	  int i;
+	  for (i = save_temps_length - 1; i >= 0; i--)
+	    if (IS_DIR_SEPARATOR (save_temps_prefix[i]))
+	      break;
+
+	  if (i >= 0)
+	    {
+	      dumpdir = xstrndup (save_temps_prefix, i + 1);
+	      issue_dumpdir = true;
+	      save_temps_length = i + 1;
+	    }
+	  else
+	    save_temps_length = 0;
+	}
+    }
+
   /* If -save-temps=obj and -o name, create the prefix to use for %b.
      Otherwise just make -save-temps=obj the same as -save-temps=cwd.  */
-  if (save_temps_flag == SAVE_TEMPS_OBJ && save_temps_prefix != NULL)
+  else if (save_temps_flag == SAVE_TEMPS_OBJ && save_temps_prefix != NULL)
     {
       save_temps_length = strlen (save_temps_prefix);
-      temp = strrchr (lbasename (save_temps_prefix), '.');
+      free (dumpdir);
+      temp = lbasename (save_temps_prefix);
+      if (temp != save_temps_prefix)
+	{
+	  dumpdir = xstrndup (save_temps_prefix,
+			      save_temps_length - strlen (temp));
+	  issue_dumpdir = true;
+	}
+      temp = strrchr (temp, '.');
       if (temp)
 	{
 	  save_temps_length -= strlen (temp);
@@ -4648,6 +4882,128 @@ process_command (unsigned int decoded_options_count,
     {
       free (save_temps_prefix);
       save_temps_prefix = NULL;
+      free (dumpdir);
+      dumpdir = NULL;
+    }
+
+  /* Check that dumpbase_ext matches the end of dumpbase, drop it
+     otherwise.  */
+  if (dumpbase_ext && dumpbase)
+    {
+      int lendb = strlen (dumpbase);
+      int lendbx = strlen (dumpbase_ext);
+
+      if (lendbx >= lendb
+	  || strcmp (dumpbase + lendb - lendbx, dumpbase_ext) != 0)
+	{
+	  free (dumpbase_ext);
+	  dumpbase_ext = NULL;
+	}
+    }
+
+  if (dumpbase
+      && (single_input_file_index () == -2
+	  || (!have_c && !explicit_dumpdir)))
+    {
+      char *prefix;
+
+      if (dumpbase_ext)
+	dumpbase[strlen (dumpbase) - strlen (dumpbase_ext)] = '\0';
+
+      /* Disregard dumpdir if dumpbase has any directory
+	 component.  */
+      for (prefix = dumpbase; *prefix; ++prefix)
+	if (IS_DIR_SEPARATOR (*prefix))
+	  break;
+
+      if (dumpdir && !*prefix)
+	prefix = concat (dumpdir, dumpbase, "-", NULL);
+      else
+	prefix = concat (dumpbase, "-", NULL);
+
+      free (dumpdir);
+      free (dumpbase);
+      free (dumpbase_ext);
+      dumpbase = dumpbase_ext = NULL;
+      dumpdir = prefix;
+      issue_dumpdir = true;
+
+      if (save_temps_length < strlen (dumpdir)
+	  || strncmp (save_temps_prefix, dumpdir, save_temps_length))
+	{
+	  free (save_temps_prefix);
+	  save_temps_prefix = xstrdup (dumpdir);
+	  save_temps_length = strlen (save_temps_prefix);
+	  append_input_name_to_save_temps_prefix = true;
+	}
+    }
+  else if (!have_c && !explicit_dumpdir)
+    {
+      const char *obase;
+      char *tofree = NULL;
+      if (!output_file || not_actual_file_p (output_file))
+	obase = "a";
+      else
+	{
+	  obase = lbasename (output_file);
+	  size_t blen = strlen (obase), xlen;
+	  /* Drop the suffix if it's dumpbase_ext-, if given,
+	     otherwise .exe or the target executable suffix, or if the
+	     output was explicitly named a.out, but not otherwise.  */
+	  if (dumpbase_ext
+	      ? (blen > (xlen = strlen (dumpbase_ext))
+		 && strcmp ((temp = (obase + blen - xlen)),
+			    dumpbase_ext) == 0)
+	      : ((temp = strrchr (obase + 1, '.'))
+		 && (xlen = strlen (temp))
+		 && (strcmp (temp, ".exe") == 0
+#if HAVE_TARGET_EXECUTABLE_SUFFIX
+		     || strcmp (temp, TARGET_EXECUTABLE_SUFFIX) == 0
+#endif
+		     || strcmp (obase, "a.out") == 0)))
+	    {
+	      tofree = xstrndup (obase, blen - xlen);
+	      obase = tofree;
+	    }
+	}
+
+      /* If we're building [dir1/]foo[.exe] out of a single input
+	 [dir2/]foo.c that shares the same basename, dump to
+	 [dir2/]foo.c.* rather than duplicating the basename into
+	 [dir2/]foo-foo.c.*.  */
+      int idxin;
+      if ((idxin = single_input_file_index ()) >= 0
+	  && adds_single_suffix_p (lbasename (infiles[idxin].name), obase))
+	{
+	  free (tofree);
+	  obase = tofree = NULL;
+	}
+      else
+	{
+	  if (dumpdir)
+	    {
+	      char *p = concat (dumpdir, obase, "-", NULL);
+	      free (dumpdir);
+	      dumpdir = p;
+	    }
+	  else
+	    dumpdir = concat (obase, "-", NULL);
+
+	  issue_dumpdir = true;
+	  free (tofree);
+	  obase = tofree = NULL;
+
+	  free (save_temps_prefix);
+	  save_temps_prefix = xstrdup (dumpdir);
+	  save_temps_length = strlen (dumpdir);
+	  append_input_name_to_save_temps_prefix = true;
+	}
+
+      /* Absent -dumpbase and present -dumpbase-ext have been applied
+	 to the linker output name, so compute fresh defaults for each
+	 compilation.  */
+      free (dumpbase_ext);
+      dumpbase_ext = NULL;
     }
 
   if (save_temps_flag && use_pipes)
@@ -5333,9 +5689,10 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 	    fatal_error (input_location, "spec %qs invalid", spec);
 
 	  case 'b':
-	    if (save_temps_length)
+	    if (!this_is_output_file && save_temps_length)
 	      obstack_grow (&obstack, save_temps_prefix, save_temps_length);
-	    else
+	    if (this_is_output_file || !save_temps_length
+		|| append_input_name_to_save_temps_prefix)
 	      obstack_grow (&obstack, input_basename, basename_length);
 	    if (compare_debug < 0)
 	      obstack_grow (&obstack, ".gk", 3);
@@ -5343,9 +5700,10 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 	    break;
 
 	  case 'B':
-	    if (save_temps_length)
+	    if (!this_is_output_file && save_temps_length)
 	      obstack_grow (&obstack, save_temps_prefix, save_temps_length);
-	    else
+	    if (this_is_output_file || !save_temps_length
+		|| append_input_name_to_save_temps_prefix)
 	      obstack_grow (&obstack, input_basename, suffixed_basename_length);
 	    if (compare_debug < 0)
 	      obstack_grow (&obstack, ".gk", 3);
@@ -5503,17 +5861,22 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 
 		/* If -save-temps=obj and -o were specified, use that for the
 		   temp file.  */
-		if (save_temps_length)
+		if (save_temps_flag && save_temps_length)
 		  {
 		    char *tmp;
 		    temp_filename_length
 		      = save_temps_length + suffix_length + 1;
+		    if (append_input_name_to_save_temps_prefix)
+		      temp_filename_length += basename_length;
 		    tmp = (char *) alloca (temp_filename_length);
 		    memcpy (tmp, save_temps_prefix, save_temps_length);
-		    memcpy (tmp + save_temps_length, suffix, suffix_length);
-		    tmp[save_temps_length + suffix_length] = '\0';
-		    temp_filename = save_string (tmp, save_temps_length
-						      + suffix_length);
+		    if (append_input_name_to_save_temps_prefix)
+		      memcpy (tmp + save_temps_length, input_basename,
+			      basename_length);
+		    memcpy (tmp + temp_filename_length - suffix_length - 1,
+			    suffix, suffix_length);
+		    tmp[temp_filename_length - 1] = '\0';
+		    temp_filename = save_string (tmp, temp_filename_length - 1);
 		    obstack_grow (&obstack, temp_filename,
 				  temp_filename_length);
 		    arg_going = 1;
@@ -9787,8 +10150,6 @@ compare_debug_dump_opt_spec_function (int arg,
   return ret;
 }
 
-static const char *debug_auxbase_opt;
-
 /* %:compare-debug-self-opt spec function.  Expands to the options
     that are to be passed in the second compilation of
     compare-debug.  */
@@ -9807,62 +10168,11 @@ compare_debug_self_opt_spec_function (int arg,
   do_spec_2 ("%{c|S:%{o*:%*}}", NULL);
   do_spec_1 (" ", 0, NULL);
 
-  if (argbuf.length () > 0)
-    debug_auxbase_opt = concat ("-auxbase-strip ",
-				argbuf.last (),
-				NULL);
-  else
-    debug_auxbase_opt = NULL;
-
   return concat ("\
 %<o %<MD %<MMD %<MF* %<MG %<MP %<MQ* %<MT* \
 %<fdump-final-insns=* -w -S -o %j \
 %{!fcompare-debug-second:-fcompare-debug-second} \
 ", compare_debug_opt, NULL);
-}
-
-/* %:compare-debug-auxbase-opt spec function.  Expands to the auxbase
-    options that are to be passed in the second compilation of
-    compare-debug.  It expects, as an argument, the basename of the
-    current input file name, with the .gk suffix appended to it.  */
-
-static const char *
-compare_debug_auxbase_opt_spec_function (int arg,
-					 const char **argv)
-{
-  char *name;
-  int len;
-
-  if (arg == 0)
-    fatal_error (input_location,
-		 "too few arguments to %%:compare-debug-auxbase-opt");
-
-  if (arg != 1)
-    fatal_error (input_location,
-		 "too many arguments to %%:compare-debug-auxbase-opt");
-
-  if (compare_debug >= 0)
-    return NULL;
-
-  len = strlen (argv[0]);
-  if (len < 3 || strcmp (argv[0] + len - 3, ".gk") != 0)
-    fatal_error (input_location, "argument to %%:compare-debug-auxbase-opt "
-		 "does not end in %<.gk%>");
-
-  if (debug_auxbase_opt)
-    return debug_auxbase_opt;
-
-#define OPT "-auxbase "
-
-  len -= 3;
-  name = (char*) xmalloc (sizeof (OPT) + len);
-  memcpy (name, OPT, sizeof (OPT) - 1);
-  memcpy (name + sizeof (OPT) - 1, argv[0], len);
-  name[sizeof (OPT) - 1 + len] = '\0';
-
-#undef OPT
-
-  return name;
 }
 
 /* %:pass-through-libs spec function.  Finds all -l options and input
@@ -9908,34 +10218,85 @@ pass_through_libs_spec_func (int argc, const char **argv)
   return prepended;
 }
 
-/* %:replace-extension spec function.  Replaces the extension of the
-   first argument with the second argument.  */
-
-const char *
-replace_extension_spec_func (int argc, const char **argv)
+static bool
+not_actual_file_p (const char *name)
 {
-  char *name;
-  char *p;
-  char *result;
-  int i;
+  return (strcmp (name, "-") == 0
+	  || strcmp (output_file, HOST_BIT_BUCKET) == 0);
+}
 
-  if (argc != 2)
-    fatal_error (input_location, "too few arguments to %%:replace-extension");
+/* %:dumps spec function.  Take an optional argument that overrides
+   the default extension for -dumpbase and -dumpbase-ext.
+   Return -dumpdir, -dumpbase and -dumpbase-ext, if needed.  */
+const char *
+dumps_spec_func (int argc, const char **argv ATTRIBUTE_UNUSED)
+{
+  const char *found_dumpbase = dumpbase;
+  const char *ext = dumpbase_ext;
+  const char *oname = output_file;
 
-  name = xstrdup (argv[0]);
+  char *args[3] = { NULL, NULL, NULL };
+  int nargs = 0;
 
-  for (i = strlen (name) - 1; i >= 0; i--)
-    if (IS_DIR_SEPARATOR (name[i]))
-      break;
+  if (argc == 1)
+    {
+      /* Do not override the explicitly-specified -dumpbase-ext with
+	 the specs-provided overrider.  */
+      if (!ext)
+	ext = argv[0];
+    }
+  else if (argc != 0)
+    fatal_error (input_location, "too many arguments for %%:dumps");
 
-  p = strrchr (name + i + 1, '.');
-  if (p != NULL)
-      *p = '\0';
+  if (oname && not_actual_file_p (oname))
+    oname = NULL;
 
-  result = concat (name, argv[1], NULL);
+  if (issue_dumpdir)
+    args[nargs++] = concat (" -dumpdir ",
+			    convert_white_space (dumpdir),
+			    NULL);
 
-  free (name);
-  return result;
+  if (!ext)
+    ext = input_basename + basename_length;
+
+  if (!found_dumpbase)
+    {
+      /* Use the output name for dumpbase iff the output name is given
+	 but it's not a linker output name.  */
+      char *base = xstrdup (oname && have_c ? lbasename (oname)
+			    : input_basename);
+      char *p = *base ? strrchr (base + 1, '.') : NULL;
+
+      if (!p || strcmp (p, ext) != 0)
+	{
+	  if (p)
+	    *p = '\0';
+	  p = concat (base, ext, NULL);
+
+	  free (base);
+	  base = p;
+	}
+
+      p = convert_white_space (base);
+      args[nargs++] = concat (" -dumpbase ", p, NULL);
+      if (p != base)
+	free (p);
+      free (base);
+    }
+
+  if (*ext)
+    {
+      char *p = convert_white_space (CONST_CAST (char *, ext));
+      args[nargs++] = concat (" -dumpbase-ext ", p, NULL);
+      if (p != ext)
+	free (p);
+    }
+
+  const char *ret = concat (args[0], args[1], args[2], NULL);
+  while (nargs > 0)
+    free (args[--nargs]);
+
+  return ret;
 }
 
 /* Returns "" if ARGV[ARGC - 2] is greater than ARGV[ARGC-1].
@@ -10085,7 +10446,7 @@ convert_white_space (char *orig)
 	}
       free (orig);
       return new_spec;
-  }
+    }
   else
     return orig;
 }
@@ -10126,6 +10487,13 @@ driver::finalize ()
   save_temps_flag = SAVE_TEMPS_NONE;
   save_temps_prefix = 0;
   save_temps_length = 0;
+  save_temps_overrides_dumpdir = false;
+  append_input_name_to_save_temps_prefix = false;
+  issue_dumpdir = false;
+  free (dumpdir);
+  free (dumpbase);
+  free (dumpbase_ext);
+  dumpdir = dumpbase = dumpbase_ext = NULL;
   spec_machine = DEFAULT_TARGET_MACHINE;
   greatest_status = 1;
 
@@ -10263,8 +10631,6 @@ driver::finalize ()
 
   mdswitches = NULL;
   n_mdswitches = 0;
-
-  debug_auxbase_opt = NULL;
 
   used_arg.finalize ();
 }
