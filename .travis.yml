@@ -1,0 +1,15 @@
+language: cpp
+sudo: required
+dist: bionic
+compiler:
+- gcc
+os:
+- linux
+ruby: 2.2.0
+script:
+ mkdir build && cd build && ../gcc/configure && make -j
+branches:
+  only:
+  - master
+notifications:
+  email: false
